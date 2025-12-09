@@ -38,16 +38,36 @@ def check_has_audio(video_path):
     return "Audio:" in proc.stderr
 
 
+def _safe_int_frames(nframes):
+    """Convert nframes from metadata to a safe int or None."""
+    if nframes is None:
+        return None
+    try:
+        # Sometimes nframes is float('inf') or a huge float
+        if isinstance(nframes, (float, np.floating)):
+            if not np.isfinite(nframes):
+                return None
+            if nframes > 1e9:   # absurdly large, treat as unknown
+                return None
+        value = int(nframes)
+        if value < 0:
+            return None
+        return value
+    except Exception:
+        return None
+
+
 def get_video_properties(video_reader, video_path):
     meta = video_reader.get_meta_data()
 
     fps = meta.get("fps", None)
     duration = meta.get("duration", None)
-    nframes = meta.get("nframes", None)
+    nframes_raw = meta.get("nframes", None)
+    nframes = _safe_int_frames(nframes_raw)
     size = meta.get("size", None)
 
-    # Fallback for duration if not provided
-    if duration is None and fps and nframes:
+    # Fallback for duration if not provided and data looks sane
+    if duration is None and fps and nframes is not None and fps > 0:
         duration = nframes / fps
 
     width, height = (size if size is not None else (None, None))
@@ -56,9 +76,9 @@ def get_video_properties(video_reader, video_path):
     return {
         "Width": width,
         "Height": height,
-        "Duration (s)": round(duration, 2) if duration is not None else None,
-        "FPS": round(fps, 2) if fps is not None else None,
-        "Frames": int(nframes) if nframes is not None else None,
+        "Duration (s)": round(duration, 2) if duration is not None and np.isfinite(duration) else None,
+        "FPS": round(fps, 2) if fps is not None and np.isfinite(fps) else None,
+        "Frames": nframes,
         "Has audio": has_audio,
         "Backend": meta.get("plugin", "ffmpeg")
     }
@@ -68,8 +88,10 @@ def get_frame_image(video_reader, time_sec):
     """Get a frame (as PIL image) at a given time in seconds."""
     meta = video_reader.get_meta_data()
     fps = meta.get("fps", 1.0) or 1.0
-    nframes = meta.get("nframes", None)
+    nframes_raw = meta.get("nframes", None)
+    nframes = _safe_int_frames(nframes_raw)
 
+    # Convert time -> frame index
     index = int(time_sec * fps)
     if nframes is not None:
         index = max(0, min(index, nframes - 1))
