@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import imageio
 import imageio_ffmpeg as ffmpeg
+import cv2
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -43,11 +44,10 @@ def _safe_int_frames(nframes):
     if nframes is None:
         return None
     try:
-        # Sometimes nframes is float('inf') or a huge float
         if isinstance(nframes, (float, np.floating)):
             if not np.isfinite(nframes):
                 return None
-            if nframes > 1e9:   # absurdly large, treat as unknown
+            if nframes > 1e9:  # absurdly large, treat as unknown
                 return None
         value = int(nframes)
         if value < 0:
@@ -66,7 +66,7 @@ def get_video_properties(video_reader, video_path):
     nframes = _safe_int_frames(nframes_raw)
     size = meta.get("size", None)
 
-    # Fallback for duration if not provided and data looks sane
+    # Fallback for duration if not provided
     if duration is None and fps and nframes is not None and fps > 0:
         duration = nframes / fps
 
@@ -91,7 +91,6 @@ def get_frame_image(video_reader, time_sec):
     nframes_raw = meta.get("nframes", None)
     nframes = _safe_int_frames(nframes_raw)
 
-    # Convert time -> frame index
     index = int(time_sec * fps)
     if nframes is not None:
         index = max(0, min(index, nframes - 1))
@@ -136,6 +135,65 @@ def extract_audio_bytes(video_path, format_ext="mp3"):
 
     mime = "audio/mpeg"
     return data, mime
+
+# ---------- Frame/image utilities (same logic as image app) ----------
+def pil_to_bgr(pil_img):
+    rgb = np.array(pil_img)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    return bgr
+
+def bgr_to_pil(img_bgr):
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
+
+def to_grayscale(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+def rotate_image(img_bgr, angle):
+    if angle == 90:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    elif angle == 180:
+        return cv2.rotate(img_bgr, cv2.ROTATE_180)
+    elif angle == 270:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img_bgr
+
+def mirror_image(img_bgr):
+    return cv2.flip(img_bgr, 1)
+
+def make_grid(img_bgr, rows=4, cols=4):
+    h, w = img_bgr.shape[:2]
+    cell_h = max(1, h // rows)
+    cell_w = max(1, w // cols)
+    grid = img_bgr.copy()
+
+    for r in range(1, rows):
+        y = r * cell_h
+        cv2.line(grid, (0, y), (w, y), (24, 165, 135), 1)
+
+    for c in range(1, cols):
+        x = c * cell_w
+        cv2.line(grid, (x, 0), (x, h), (24, 165, 135), 1)
+
+    return grid
+
+def detect_objects(img_bgr, min_area=500):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    out = img_bgr.copy()
+    count = 0
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area > min_area:
+            x,y,w,h = cv2.boundingRect(c)
+            cv2.rectangle(out, (x,y), (x+w, y+h), (24,165,135), 2)
+            count += 1
+
+    return out, count
 
 # ---------- Styling ----------
 st.markdown(
@@ -246,7 +304,7 @@ else:
         st.markdown("<div class='card'><b>Video Preview</b></div>", unsafe_allow_html=True)
         st.video(uploaded_file)
 
-    # Frames
+    # Frames (all your image-style functions here)
     with tabs[1]:
         st.markdown("<div class='card'><b>Frame Explorer (Image part)</b></div>", unsafe_allow_html=True)
         duration = props["Duration (s)"]
@@ -261,8 +319,75 @@ else:
                 value=float(default_time),
                 step=0.5,
             )
+
+            # Get base frame
             frame_img = get_frame_image(video_reader, time_sec)
-            st.image(frame_img, caption=f"Frame at {time_sec:.2f} s", use_column_width=True)
+            frame_bgr = pil_to_bgr(frame_img)
+
+            frame_tabs = st.tabs(["Show", "Grayscale", "Rotate", "Mirror", "Grid", "Detect", "Cuts"])
+
+            # Show
+            with frame_tabs[0]:
+                st.markdown("<div class='card'><b>Original Frame</b></div>", unsafe_allow_html=True)
+                st.image(frame_img, use_column_width=True)
+
+            # Grayscale
+            with frame_tabs[1]:
+                st.markdown("<div class='card'><b>Grayscale</b></div>", unsafe_allow_html=True)
+                gray = to_grayscale(frame_bgr)
+                st.image(gray, use_column_width=True)
+
+            # Rotate
+            with frame_tabs[2]:
+                st.markdown("<div class='card'><b>Rotate</b></div>", unsafe_allow_html=True)
+                angle = st.radio("Choose angle", [90, 180, 270], horizontal=True)
+                rotated = rotate_image(frame_bgr, angle)
+                st.image(bgr_to_pil(rotated), use_column_width=True)
+
+            # Mirror
+            with frame_tabs[3]:
+                st.markdown("<div class='card'><b>Mirror (Horizontal)</b></div>", unsafe_allow_html=True)
+                mirrored = mirror_image(frame_bgr)
+                st.image(bgr_to_pil(mirrored), use_column_width=True)
+
+            # Grid
+            with frame_tabs[4]:
+                st.markdown("<div class='card'><b>Grid (4×4)</b></div>", unsafe_allow_html=True)
+                grid_img = make_grid(frame_bgr)
+                st.image(bgr_to_pil(grid_img), use_column_width=True)
+
+            # Detect
+            with frame_tabs[5]:
+                st.markdown("<div class='card'><b>Object Detection (No DL)</b></div>", unsafe_allow_html=True)
+                detected, count = detect_objects(frame_bgr)
+                st.write(f"Objects detected: **{count}**")
+                st.image(bgr_to_pil(detected), use_column_width=True)
+
+            # Cuts
+            with frame_tabs[6]:
+                st.markdown("<div class='card'><b>Cuts / Crops</b></div>", unsafe_allow_html=True)
+                h, w = frame_bgr.shape[:2]
+
+                left = frame_bgr[:, :w//2]
+                right = frame_bgr[:, w//2:]
+                top = frame_bgr[:h//2, :]
+                bottom = frame_bgr[h//2:, :]
+
+                split = int(w * 0.8)
+                p80 = frame_bgr[:, :split]
+                p20 = frame_bgr[:, split:]
+
+                colA, colB = st.columns(2)
+                with colA:
+                    st.image(bgr_to_pil(left), caption="Left 50%", use_column_width=True)
+                    st.image(bgr_to_pil(top), caption="Top 50%", use_column_width=True)
+                with colB:
+                    st.image(bgr_to_pil(right), caption="Right 50%", use_column_width=True)
+                    st.image(bgr_to_pil(bottom), caption="Bottom 50%", use_column_width=True)
+
+                st.write("### Vertical 80 / 20")
+                st.image(bgr_to_pil(p80), caption="80%", use_column_width=True)
+                st.image(bgr_to_pil(p20), caption="20%", use_column_width=True)
 
     # Audio
     with tabs[2]:
