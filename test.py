@@ -2,8 +2,9 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import tempfile
-import io
-from moviepy.editor import VideoFileClip
+import subprocess
+import imageio
+import imageio_ffmpeg as ffmpeg
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -22,49 +23,96 @@ def save_uploaded_video(uploaded_file):
     tfile.flush()
     return tfile.name
 
-def get_video_clip(video_path):
-    """Create a MoviePy VideoFileClip."""
-    return VideoFileClip(video_path)
 
-def get_video_properties(clip):
-    fps = getattr(clip, "fps", None) or getattr(clip.reader, "fps", None)
-    duration = clip.duration if clip.duration is not None else 0
-    frame_count = int(fps * duration) if fps and duration else None
+def load_video_reader(video_path):
+    """Create an imageio video reader (FFmpeg-based)."""
+    return imageio.get_reader(video_path, "ffmpeg")
+
+
+def check_has_audio(video_path):
+    """Check if video file has an audio stream using ffmpeg."""
+    ffmpeg_binary = ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg_binary, "-i", video_path]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # FFmpeg prints stream info to stderr; search for 'Audio:'
+    return "Audio:" in proc.stderr
+
+
+def get_video_properties(video_reader, video_path):
+    meta = video_reader.get_meta_data()
+
+    fps = meta.get("fps", None)
+    duration = meta.get("duration", None)
+    nframes = meta.get("nframes", None)
+    size = meta.get("size", None)
+
+    # Fallback for duration if not provided
+    if duration is None and fps and nframes:
+        duration = nframes / fps
+
+    width, height = (size if size is not None else (None, None))
+    has_audio = check_has_audio(video_path)
 
     return {
-        "Width": clip.w,
-        "Height": clip.h,
-        "Duration (s)": round(duration, 2),
-        "FPS": round(fps, 2) if fps else None,
-        "Frames": frame_count,
-        "Has audio": clip.audio is not None
+        "Width": width,
+        "Height": height,
+        "Duration (s)": round(duration, 2) if duration is not None else None,
+        "FPS": round(fps, 2) if fps is not None else None,
+        "Frames": int(nframes) if nframes is not None else None,
+        "Has audio": has_audio,
+        "Backend": meta.get("plugin", "ffmpeg")
     }
 
-def get_frame_image(clip, time_sec):
+
+def get_frame_image(video_reader, time_sec):
     """Get a frame (as PIL image) at a given time in seconds."""
-    time_sec = max(0, min(time_sec, max(clip.duration - 1e-3, 0)))
-    frame = clip.get_frame(time_sec)  # RGB numpy array
-    img = Image.fromarray(frame)
+    meta = video_reader.get_meta_data()
+    fps = meta.get("fps", 1.0) or 1.0
+    nframes = meta.get("nframes", None)
+
+    index = int(time_sec * fps)
+    if nframes is not None:
+        index = max(0, min(index, nframes - 1))
+    else:
+        index = max(0, index)
+
+    frame = video_reader.get_data(index)  # numpy array (H,W,3) in RGB
+    img = Image.fromarray(frame.astype(np.uint8))
     return img
 
-def extract_audio_bytes(clip, format_ext="mp3"):
-    """
-    Extract audio from clip and return bytes.
-    Requires ffmpeg to be available in the environment.
-    """
-    if clip.audio is None:
-        return None, None
 
+def extract_audio_bytes(video_path, format_ext="mp3"):
+    """
+    Extract audio track from video and return (bytes, mime).
+    Returns (None, None) if extraction fails.
+    """
+    ffmpeg_binary = ffmpeg.get_ffmpeg_exe()
     tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=f".{format_ext}")
     tmp_audio.close()
 
-    # Suppress verbose moviepy logger
-    clip.audio.write_audiofile(tmp_audio.name, logger=None)
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-i", video_path,
+        "-vn",              # no video
+        "-acodec", "mp3",   # MP3 audio codec
+        tmp_audio.name
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    with open(tmp_audio.name, "rb") as f:
-        data = f.read()
+    if proc.returncode != 0:
+        return None, None
 
-    mime = "audio/mpeg" if format_ext == "mp3" else "audio/wav"
+    try:
+        with open(tmp_audio.name, "rb") as f:
+            data = f.read()
+    except Exception:
+        return None, None
+
+    if not data:
+        return None, None
+
+    mime = "audio/mpeg"
     return data, mime
 
 # ---------- Styling ----------
@@ -132,28 +180,31 @@ if uploaded_file is None:
         unsafe_allow_html=True
     )
 else:
-    # Save and open video
+    # Save file and open reader
     video_path = save_uploaded_video(uploaded_file)
-    clip = get_video_clip(video_path)
-    props = get_video_properties(clip)
+    video_reader = load_video_reader(video_path)
+    props = get_video_properties(video_reader, video_path)
 
     # KPI row
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     with c1:
+        res_text = f"{props['Width']} × {props['Height']}" if props["Width"] and props["Height"] else "Unknown"
         st.markdown(
-            f"<div class='kpi card'><b>{props['Width']} × {props['Height']}</b>"
+            f"<div class='kpi card'><b>{res_text}</b>"
             "<div class='small-muted'>Resolution</div></div>",
             unsafe_allow_html=True
         )
     with c2:
+        dur_text = f"{props['Duration (s)']} s" if props["Duration (s)"] is not None else "Unknown"
         st.markdown(
-            f"<div class='kpi card'><b>{props['Duration (s)']} s</b>"
+            f"<div class='kpi card'><b>{dur_text}</b>"
             "<div class='small-muted'>Duration</div></div>",
             unsafe_allow_html=True
         )
     with c3:
+        fps_text = f"{props['FPS']}" if props["FPS"] is not None else "Unknown"
         st.markdown(
-            f"<div class='kpi card'><b>{props['FPS']}</b>"
+            f"<div class='kpi card'><b>{fps_text}</b>"
             "<div class='small-muted'>FPS</div></div>",
             unsafe_allow_html=True
         )
@@ -171,16 +222,14 @@ else:
     # Preview
     with tabs[0]:
         st.markdown("<div class='card'><b>Video Preview</b></div>", unsafe_allow_html=True)
-        # Use original uploaded file object for preview
         st.video(uploaded_file)
 
     # Frames
     with tabs[1]:
         st.markdown("<div class='card'><b>Frame Explorer (Image part)</b></div>", unsafe_allow_html=True)
-
-        duration = props["Duration (s)"] or 0.0
-        if duration <= 0:
-            st.warning("Could not determine video duration.")
+        duration = props["Duration (s)"]
+        if duration is None or duration <= 0:
+            st.warning("Could not determine video duration for frame selection.")
         else:
             default_time = float(duration / 2.0)
             time_sec = st.slider(
@@ -190,7 +239,7 @@ else:
                 value=float(default_time),
                 step=0.5,
             )
-            frame_img = get_frame_image(clip, time_sec)
+            frame_img = get_frame_image(video_reader, time_sec)
             st.image(frame_img, caption=f"Frame at {time_sec:.2f} s", use_column_width=True)
 
     # Audio
@@ -198,7 +247,7 @@ else:
         st.markdown("<div class='card'><b>Audio Extraction (Audio part)</b></div>", unsafe_allow_html=True)
 
         if not props["Has audio"]:
-            st.warning("This video has no audio track.")
+            st.warning("This video appears to have no audio track.")
         else:
             st.markdown(
                 "<p class='small-muted'>Extract and play/download the audio from this video.</p>",
@@ -207,7 +256,7 @@ else:
 
             if st.button("Extract audio as MP3"):
                 with st.spinner("Extracting audio..."):
-                    audio_bytes, mime = extract_audio_bytes(clip, format_ext="mp3")
+                    audio_bytes, mime = extract_audio_bytes(video_path, format_ext="mp3")
 
                 if audio_bytes is not None:
                     st.audio(audio_bytes, format=mime)
@@ -218,13 +267,19 @@ else:
                         mime=mime,
                     )
                 else:
-                    st.error("Failed to extract audio.")
+                    st.error("Failed to extract audio. The file may not contain an audio track or ffmpeg failed.")
 
     # Properties
     with tabs[3]:
         st.markdown("<div class='card'><b>Video Properties</b></div>", unsafe_allow_html=True)
         for k, v in props.items():
             st.write(f"**{k}:** {v}")
+
+    # Close reader
+    try:
+        video_reader.close()
+    except Exception:
+        pass
 
 # Footer
 st.markdown("<div class='footer'>Built for Practical • Practical Video Lab</div>", unsafe_allow_html=True)
