@@ -102,23 +102,43 @@ def get_frame_image(video_reader, time_sec):
     return img
 
 
-def extract_audio_bytes(video_path, format_ext="mp3"):
+def extract_audio_bytes(video_path, format_ext="mp3", speed=1.0, start_time=None, end_time=None):
     """
-    Extract audio track from video and return (bytes, mime).
-    Returns (None, None) if extraction fails.
+    Extract audio track from video (optionally trimmed & speed-changed)
+    and return (bytes, mime). Returns (None, None) if extraction fails.
     """
     ffmpeg_binary = ffmpeg.get_ffmpeg_exe()
     tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=f".{format_ext}")
     tmp_audio.close()
 
-    cmd = [
-        ffmpeg_binary,
-        "-y",
-        "-i", video_path,
-        "-vn",              # no video
-        "-acodec", "mp3",   # MP3 audio codec
-        tmp_audio.name
-    ]
+    cmd = [ffmpeg_binary, "-y"]
+
+    # Optional start / end trimming
+    if start_time is not None and start_time >= 0:
+        cmd.extend(["-ss", str(float(start_time))])
+    if end_time is not None and end_time > 0:
+        cmd.extend(["-to", str(float(end_time))])
+
+    cmd.extend(["-i", video_path, "-vn"])  # no video
+
+    # Audio codec / container
+    if format_ext.lower() == "wav":
+        cmd.extend(["-acodec", "pcm_s16le"])
+        mime = "audio/wav"
+    else:  # default mp3
+        cmd.extend(["-acodec", "mp3"])
+        mime = "audio/mpeg"
+
+    # Speed change (atempo supports 0.5 to 2.0)
+    if speed is None or speed == 1.0:
+        pass
+    else:
+        # Clamp speed to valid range just in case
+        speed = max(0.5, min(speed, 2.0))
+        cmd.extend(["-filter:a", f"atempo={speed}"])
+
+    cmd.append(tmp_audio.name)
+
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     if proc.returncode != 0:
@@ -133,7 +153,6 @@ def extract_audio_bytes(video_path, format_ext="mp3"):
     if not data:
         return None, None
 
-    mime = "audio/mpeg"
     return data, mime
 
 # ---------- Frame/image utilities (same logic as image app) ----------
@@ -304,7 +323,7 @@ else:
         st.markdown("<div class='card'><b>Video Preview</b></div>", unsafe_allow_html=True)
         st.video(uploaded_file)
 
-    # Frames (all your image-style functions here)
+    # Frames (all image-style functions)
     with tabs[1]:
         st.markdown("<div class='card'><b>Frame Explorer (Image part)</b></div>", unsafe_allow_html=True)
         duration = props["Duration (s)"]
@@ -391,30 +410,62 @@ else:
 
     # Audio
     with tabs[2]:
-        st.markdown("<div class='card'><b>Audio Extraction (Audio part)</b></div>", unsafe_allow_html=True)
+        st.markdown("<div class='card'><b>Audio Lab (Audio part)</b></div>", unsafe_allow_html=True)
 
         if not props["Has audio"]:
             st.warning("This video appears to have no audio track.")
         else:
             st.markdown(
-                "<p class='small-muted'>Extract and play/download the audio from this video.</p>",
+                "<p class='small-muted'>Extract a portion of the audio, change speed, and download it.</p>",
                 unsafe_allow_html=True
             )
 
-            if st.button("Extract audio as MP3"):
-                with st.spinner("Extracting audio..."):
-                    audio_bytes, mime = extract_audio_bytes(video_path, format_ext="mp3")
+            audio_duration = props["Duration (s)"] or 0.0
+            if audio_duration <= 0:
+                audio_duration = 60.0  # fallback just in case
+
+            # Range selector
+            start_sec, end_sec = st.slider(
+                "Select audio range (seconds)",
+                min_value=0.0,
+                max_value=float(audio_duration),
+                value=(0.0, float(audio_duration)),
+                step=0.5,
+            )
+
+            # Speed selector
+            speed = st.select_slider(
+                "Playback speed (affects output audio)",
+                options=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+                value=1.0,
+            )
+
+            # Format selector
+            fmt = st.radio("Output format", ["mp3", "wav"], horizontal=True)
+
+            if st.button("Extract audio with settings"):
+                with st.spinner("Processing audio..."):
+                    audio_bytes, mime = extract_audio_bytes(
+                        video_path,
+                        format_ext=fmt,
+                        speed=speed,
+                        start_time=start_sec,
+                        end_time=end_sec,
+                    )
 
                 if audio_bytes is not None:
+                    st.write(
+                        f"Extracted segment: **{start_sec:.2f} s → {end_sec:.2f} s** at **{speed}x** speed."
+                    )
                     st.audio(audio_bytes, format=mime)
                     st.download_button(
-                        "Download audio",
+                        "Download processed audio",
                         data=audio_bytes,
-                        file_name="extracted_audio.mp3",
+                        file_name=f"extracted_audio_{start_sec:.0f}-{end_sec:.0f}_{speed}x.{fmt}",
                         mime=mime,
                     )
                 else:
-                    st.error("Failed to extract audio. The file may not contain an audio track or ffmpeg failed.")
+                    st.error("Failed to extract audio. The file may not contain a valid audio track or ffmpeg failed.")
 
     # Properties
     with tabs[3]:
